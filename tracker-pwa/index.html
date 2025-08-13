@@ -1,0 +1,574 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <title>Client Training Tracker</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { background:#0a0a0a; color:#e5e7eb; }
+    .animate-pulse { animation: pulse 1s ease-in-out infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('./sw.js');
+      });
+      // Request persistent storage if available
+      if (navigator.storage && navigator.storage.persist) {
+        navigator.storage.persist();
+      }
+    }
+  </script>
+
+  <!-- React + Babel -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <script type="text/babel">
+    const { useEffect, useMemo, useState, useRef } = React;
+
+    // ---- Utilities ----
+    const STORAGE_KEY = "trainer_clients_v1";
+
+    function uid() {
+      return Math.random().toString(36).slice(2, 9);
+    }
+
+    function loadData() {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return { clients: {}, selectedClientId: null };
+        const data = JSON.parse(raw);
+        if (!data.clients) return { clients: {}, selectedClientId: null };
+        return data;
+      } catch (e) {
+        console.error("Failed to load data", e);
+        return { clients: {}, selectedClientId: null };
+      }
+    }
+
+    function saveData(data) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    }
+
+    function ensureWeek(client, week) {
+      if (!client.weeks) client.weeks = {};
+      if (!client.weeks[week]) client.weeks[week] = { notes: "", exercises: [] };
+    }
+
+    function deepClone(o) {
+      return JSON.parse(JSON.stringify(o));
+    }
+
+    function countActiveWeeks(client) {
+      const weeks = client?.weeks || {};
+      let count = 0;
+      for (const w of Object.values(weeks)) {
+        if (Array.isArray(w.exercises) && w.exercises.length > 0) count++;
+      }
+      return count;
+    }
+
+    function formatTime(ts) {
+      try { return new Date(ts).toLocaleTimeString(); } catch { return ""; }
+    }
+
+    function setClientWeekPure(state, clientId, nextWeek) {
+      const next = deepClone(state);
+      const c = next.clients?.[clientId];
+      if (!c) return next;
+      const wk = Math.max(1, parseInt(nextWeek || 1, 10));
+      c.currentWeek = wk;
+      ensureWeek(c, wk);
+      return next;
+    }
+
+    function clearWeekPure(state, clientId, week) {
+      const next = deepClone(state);
+      const c = next.clients?.[clientId];
+      if (!c || !c.weeks) return next;
+      delete c.weeks[week];
+      if (c.currentWeek === week) {
+        const remaining = Object.keys(c.weeks || {})
+          .map((n) => parseInt(n, 10))
+          .filter((n) => Number.isFinite(n));
+        if (remaining.length > 0) {
+          const le = remaining.filter((w) => w <= week);
+          c.currentWeek = le.length > 0 ? Math.max(...le) : Math.min(...remaining);
+        } else {
+          c.currentWeek = 1;
+        }
+      }
+      return next;
+    }
+
+    let __ranSelfTests = false;
+    function runSelfTests() {
+      if (__ranSelfTests) return;
+      __ranSelfTests = true;
+      try {
+        const a = uid();
+        console.assert(typeof a === "string" && a.length >= 5, "uid() short id");
+        const obj = { x: 1, y: { z: 2 } };
+        const cpy = deepClone(obj);
+        console.assert(cpy !== obj && cpy.y !== obj.y && cpy.y.z === 2, "deepClone");
+        const client = { weeks: {} };
+        ensureWeek(client, 5);
+        console.assert(!!client.weeks[5] && Array.isArray(client.weeks[5].exercises), "ensureWeek");
+        const st4 = { clients: { x:{id:'x',name:'X',currentWeek:2,weeks:{}}, y:{id:'y',name:'Y',currentWeek:5,weeks:{}} }, selectedClientId:'x' };
+        const st4b = setClientWeekPure(st4, 'x', 3);
+        console.assert(st4b.clients.x.currentWeek === 3, 'week set');
+        const st5 = { clients: { p:{id:'p',name:'P',currentWeek:2,weeks:{ 2:{ notes:'gone', exercises:[{id:'1'},{id:'2'}] } } } } };
+        const st5b = clearWeekPure(st5, 'p', 2);
+        console.assert(!st5b.clients.p.weeks[2], 'deleted week');
+      } catch (e) { console.error("Self-tests failed", e); }
+    }
+
+    function App() {
+      const [data, setData] = useState(loadData);
+      const [query, setQuery] = useState("");
+      const [newClientName, setNewClientName] = useState("");
+      const [importMode, setImportMode] = useState("merge");
+      const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+      const [clearDialog, setClearDialog] = useState(null);
+      const [autosave, setAutosave] = useState({ isSaving: false, last: null });
+      const [sidebarOpen, setSidebarOpen] = useState(true);
+      const [toast, setToast] = useState(null);
+      const [pasteDialog, setPasteDialog] = useState(false);
+      const [pasteText, setPasteText] = useState("");
+      const dataRef = useRef(data);
+
+      useEffect(() => { saveData(data); }, [data]);
+      useEffect(() => { runSelfTests(); }, []);
+      useEffect(() => { dataRef.current = data; }, [data]);
+
+      useEffect(() => {
+        const id = setInterval(() => {
+          setAutosave(s => ({ ...s, isSaving: true }));
+          try { saveData(dataRef.current); }
+          finally {
+            const now = Date.now();
+            setTimeout(() => setAutosave({ isSaving: false, last: now }), 500);
+          }
+        }, 20000);
+        return () => clearInterval(id);
+      }, []);
+
+      useEffect(() => {
+        if (!toast) return;
+        const t = setTimeout(() => setToast(null), 2000);
+        return () => clearTimeout(t);
+      }, [toast]);
+
+      const clientsArr = useMemo(() => Object.values(data.clients || {}), [data]);
+      const filteredClients = useMemo(() => {
+        const q = query.trim().toLowerCase();
+        if (!q) return clientsArr.sort((a,b)=>a.name.localeCompare(b.name));
+        return clientsArr.filter(c=>c.name.toLowerCase().includes(q))
+                         .sort((a,b)=>a.name.localeCompare(b.name));
+      }, [clientsArr, query]);
+
+      const selectedClient = useMemo(() => {
+        if (!data.selectedClientId) return null;
+        return data.clients?.[data.selectedClientId] || null;
+      }, [data]);
+
+      const currentWeek = selectedClient?.currentWeek || 1;
+
+      function setCurrentWeekForSelected(nextWeek) {
+        setData(prev => {
+          const id = prev.selectedClientId;
+          if (!id) return prev;
+          return setClientWeekPure(prev, id, nextWeek);
+        });
+      }
+
+      function addClient() {
+        const name = (newClientName || "").trim();
+        if (!name) { alert("Enter a client name first."); return; }
+        const id = uid();
+        const newClient = { id, name, currentWeek: 1, weeks: {} };
+        setData(prev => {
+          const next = deepClone(prev);
+          next.clients[id] = newClient;
+          next.selectedClientId = id;
+          return next;
+        });
+        setNewClientName("");
+      }
+
+      function selectClient(id) {
+        setData(prev => ({ ...prev, selectedClientId: id }));
+      }
+
+      function deleteClient(id) {
+        setData(prev => {
+          const next = deepClone(prev);
+          delete next.clients[id];
+          if (next.selectedClientId === id) next.selectedClientId = null;
+          return next;
+        });
+      }
+
+      function updateWeekNotes(clientId, week, notes) {
+        setData(prev => {
+          const next = deepClone(prev);
+          const c = next.clients[clientId];
+          ensureWeek(c, week);
+          c.weeks[week].notes = notes;
+          return next;
+        });
+      }
+
+      function addExerciseRow(clientId, week) {
+        setData(prev => {
+          const next = deepClone(prev);
+          const c = next.clients[clientId];
+          ensureWeek(c, week);
+          c.weeks[week].exercises.push({
+            id: uid(), exercise: "", variation: "", sets: "", reps: "", load: "", rest: ""
+          });
+          return next;
+        });
+      }
+
+      function updateExercise(clientId, week, rowId, field, value) {
+        setData(prev => {
+          const next = deepClone(prev);
+          const c = next.clients[clientId];
+          ensureWeek(c, week);
+          const rows = c.weeks[week].exercises;
+          const idx = rows.findIndex(r => r.id === rowId);
+          if (idx !== -1) rows[idx][field] = value;
+          return next;
+        });
+      }
+
+      function removeExercise(clientId, week, rowId) {
+        setData(prev => {
+          const next = deepClone(prev);
+          const rows = next.clients[clientId].weeks[week].exercises;
+          next.clients[clientId].weeks[week].exercises = rows.filter(r => r.id !== rowId);
+          return next;
+        });
+      }
+
+      function duplicatePreviousWeek(clientId, week) {
+        if (week <= 1) return;
+        setData(prev => {
+          const next = deepClone(prev);
+          const c = next.clients[clientId];
+          ensureWeek(c, week - 1);
+          ensureWeek(c, week);
+          const prevWeek = c.weeks[week - 1];
+          c.weeks[week] = {
+            notes: prevWeek.notes || "",
+            exercises: (prevWeek.exercises || []).map(r => ({ ...r, id: uid() })),
+          };
+          return next;
+        });
+      }
+
+      function clearWeek(clientId, week) {
+        setData(prev => clearWeekPure(prev, clientId, week));
+      }
+
+      function exportJSON() {
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = "trainer_clients.json"; a.click();
+        URL.revokeObjectURL(url);
+      }
+
+      function importJSON(e) {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+          try {
+            const incoming = JSON.parse(reader.result);
+            if (importMode === "replace") setData(incoming);
+            else {
+              setData(prev => {
+                const next = deepClone(prev);
+                for (const [id, client] of Object.entries(incoming.clients || {})) {
+                  if (!next.clients[id]) next.clients[id] = client;
+                  else {
+                    next.clients[id].name = client.name || next.clients[id].name;
+                    next.clients[id].currentWeek = client.currentWeek || next.clients[id].currentWeek || 1;
+                    next.clients[id].weeks = { ...(next.clients[id].weeks || {}), ...(client.weeks || {}) };
+                  }
+                }
+                return next;
+              });
+            }
+          } catch {
+            alert("Invalid JSON file.");
+          }
+        };
+        reader.readAsText(file);
+        e.target.value = "";
+      }
+
+      async function copyBackup() {
+        try {
+          await navigator.clipboard.writeText(JSON.stringify(data));
+          setToast({ msg: "Backup copied to clipboard", ts: Date.now() });
+        } catch (e) {
+          try { setPasteText(JSON.stringify(data, null, 2)); } catch {}
+          setPasteDialog(true);
+        }
+      }
+
+      function applyPastedData(mode = "merge") {
+        try {
+          const incoming = JSON.parse(pasteText || "{}");
+          if (mode === "replace") setData(incoming);
+          else {
+            setData(prev => {
+              const next = deepClone(prev);
+              for (const [id, client] of Object.entries(incoming.clients || {})) {
+                if (!next.clients[id]) next.clients[id] = client;
+                else {
+                  next.clients[id].name = client.name || next.clients[id].name;
+                  next.clients[id].currentWeek = client.currentWeek || next.clients[id].currentWeek || 1;
+                  next.clients[id].weeks = { ...(next.clients[id].weeks || {}), ...(client.weeks || {}) };
+                }
+              }
+              return next;
+            });
+          }
+          setToast({ msg: "Backup restored", ts: Date.now() });
+          setPasteDialog(false); setPasteText("");
+        } catch {
+          alert("That doesn't look like valid JSON.");
+        }
+      }
+
+      return (
+        <div className="min-h-screen">
+          <header className="sticky top-0 z-10 border-b border-neutral-800 bg-neutral-950/80 backdrop-blur px-4 py-3 flex items-center gap-3">
+            <button
+              className="rounded-xl border border-neutral-800 px-2 py-1 hover:bg-neutral-900"
+              onClick={() => setSidebarOpen(s => !s)}
+              title={sidebarOpen ? "Collapse sidebar" : "Expand sidebar"}>
+              {sidebarOpen ? "◀" : "▶"} Sidebar
+            </button>
+            <div className="text-xl font-semibold">Client Training Tracker</div>
+            <div className="ml-auto flex items-center gap-2">
+              <label className="text-sm opacity-80">Import mode:</label>
+              <button className="rounded-xl border border-neutral-800 px-3 py-1.5 hover:bg-neutral-900"
+                      onClick={copyBackup} title="Copy JSON backup to clipboard">Copy backup</button>
+              <button className="rounded-xl border border-neutral-800 px-3 py-1.5 hover:bg-neutral-900"
+                      onClick={() => setPasteDialog(true)} title="Restore from pasted JSON">Paste backup</button>
+              <select className="bg-neutral-900 rounded px-2 py-1 border border-neutral-800"
+                      value={importMode} onChange={(e)=>setImportMode(e.target.value)}>
+                <option value="merge">Merge</option>
+                <option value="replace">Replace</option>
+              </select>
+              <button className="rounded-xl border border-neutral-800 px-3 py-1.5 hover:bg-neutral-900"
+                      onClick={exportJSON} title="Export everything as JSON">Export JSON</button>
+              <label className="rounded-xl border border-neutral-800 px-3 py-1.5 hover:bg-neutral-900 cursor-pointer">
+                Import JSON
+                <input type="file" accept="application/json" className="hidden" onChange={importJSON} />
+              </label>
+            </div>
+          </header>
+
+          <main className="grid grid-cols-12 gap-0">
+            <aside className={sidebarOpen ? "col-span-12 md:col-span-4 lg:col-span-3 xl:col-span-2 border-r border-neutral-900 p-4 space-y-3" : "hidden"}>
+              <div className="space-y-2">
+                <div className="flex gap-2">
+                  <input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search clients..."
+                    className="w-full bg-neutral-900 border border-neutral-800 rounded-xl px-3 py-2 outline-none focus:ring-2 focus:ring-neutral-700" />
+                </div>
+                <div className="flex gap-2">
+                  <input value={newClientName} onChange={e=>setNewClientName(e.target.value)} onKeyDown={(e)=>{ if(e.key==='Enter') addClient(); }}
+                    placeholder="New client name"
+                    className="w-full bg-neutral-900 border border-neutral-800 rounded-xl px-3 py-2 outline-none focus:ring-2 focus:ring-neutral-700" />
+                  <button className="shrink-0 rounded-xl border border-neutral-800 px-3 py-2 hover:bg-neutral-900" onClick={addClient}>+ Add</button>
+                </div>
+              </div>
+
+              <div className="text-xs opacity-70">{filteredClients.length} client{filteredClients.length===1? "" : "s"}</div>
+
+              <ul className="space-y-1 max-h-[calc(100vh-220px)] overflow-auto pr-1">
+                {filteredClients.map((c) => (
+                  <li key={c.id}>
+                    <button onClick={()=>selectClient(c.id)} className={`w-full text-left px-3 py-2 rounded-lg border border-neutral-900 hover:border-neutral-700 ${selectedClient?.id===c.id ? "bg-neutral-900 border-neutral-700": ""}`}>
+                      <div className="font-medium truncate">{c.name}</div>
+                      <div className="text-xs opacity-60">Weeks: {countActiveWeeks(c)}</div>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </aside>
+
+            <section className={sidebarOpen ? "col-span-12 md:col-span-8 lg:col-span-9 xl:col-span-10 p-4" : "col-span-12 p-4"}>
+              {!selectedClient ? (
+                <div className="h-[60vh] grid place-items-center text-neutral-400">Select a client to begin, or add a new one.</div>
+              ) : (
+                <div className="space-y-4">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="text-lg font-semibold px-3 py-2 bg-neutral-900 border border-neutral-800 rounded-xl">
+                      {selectedClient.name}
+                    </div>
+                    <button className="ml-auto rounded-xl border border-red-900 text-red-300 px-3 py-2 hover:bg-red-950/40" onClick={()=>setShowDeleteConfirm(true)}>Delete client</button>
+                    <button className="rounded-xl border border-neutral-800 px-3 py-2 hover:bg-neutral-900" onClick={()=>{
+                      // Export current client CSV
+                      const client = selectedClient;
+                      const rows = [["Client","Week","Exercise","Variation","Sets","Reps","Load/Intensity","Rest","Notes (per week)"]];
+                      for (const [weekStr, w] of Object.entries(client.weeks || {})) {
+                        const week = parseInt(weekStr, 10);
+                        if (!w.exercises || w.exercises.length === 0) {
+                          rows.push([client.name, week, "", "", "", "", "", "", w.notes || ""]);
+                        } else {
+                          for (const ex of w.exercises) {
+                            rows.push([client.name, week, ex.exercise||"", ex.variation||"", ex.sets||"", ex.reps||"", ex.load||"", ex.rest||"", w.notes||""]);
+                          }
+                        }
+                      }
+                      const csv = rows.map(r=>r.map(x=>`"${String(x).replaceAll('"','""')}"`).join(",")).join("\n");
+                      const blob = new Blob([csv], {type:"text/csv;charset=utf-8;"});
+                      const url = URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=`${client.name.replaceAll(" ", "_")}_export.csv`; a.click(); URL.revokeObjectURL(url);
+                    }}>Export CSV (this client)</button>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2 border border-neutral-900 rounded-xl p-3 bg-neutral-950/40">
+                    <div className="text-sm opacity-80">Week</div>
+                    <button className="rounded-lg border border-neutral-800 px-2 py-1 hover:bg-neutral-900" onClick={()=>setCurrentWeekForSelected(currentWeek - 1)} title="Previous week">◀</button>
+                    <input type="number" value={currentWeek} onChange={(e)=>{ const n=parseInt(e.target.value||"1",10); setCurrentWeekForSelected(n); }}
+                      className="w-24 bg-neutral-900 border border-neutral-800 rounded-xl px-3 py-2" />
+                    <button className="rounded-lg border border-neutral-800 px-2 py-1 hover:bg-neutral-900" onClick={()=>setCurrentWeekForSelected(currentWeek + 1)} title="Next week">▶</button>
+                    <button className="ml-2 rounded-xl border border-neutral-800 px-3 py-2 hover:bg-neutral-900" onClick={()=>duplicatePreviousWeek(selectedClient.id, currentWeek)} title="Copy previous week's plan into this week">Duplicate previous week</button>
+                    <button className="rounded-xl border border-neutral-800 px-3 py-2 hover:bg-neutral-900" onClick={()=>setClearDialog({ clientId: selectedClient.id, week: currentWeek })}>Clear week</button>
+                  </div>
+
+                  <div className="space-y-2">
+                    <div className="text-sm opacity-80">Notes (for Week {currentWeek})</div>
+                    <textarea rows={3} value={selectedClient.weeks?.[currentWeek]?.notes || ""} onChange={(e)=>updateWeekNotes(selectedClient.id, currentWeek, e.target.value)} className="w-full bg-neutral-900 border border-neutral-800 rounded-xl px-3 py-2" placeholder="Coaching cues, goals, fatigue, deloads, etc." />
+                  </div>
+
+                  <div className="border border-neutral-900 rounded-xl overflow-hidden">
+                    <div className="flex items-center justify-between px-3 py-2 bg-neutral-900/50 border-b border-neutral-900">
+                      <div className="text-sm opacity-80">Exercises for Week {currentWeek}</div>
+                      <button className="rounded-lg border border-neutral-800 px-3 py-1.5 hover:bg-neutral-900" onClick={()=>addExerciseRow(selectedClient.id, currentWeek)}>+ Add exercise</button>
+                    </div>
+
+                    <div className="overflow-auto">
+                      <table className="w-full text-sm">
+                        <thead className="bg-neutral-950/60">
+                          <tr className="border-b border-neutral-900 text-left">
+                            <th className="px-3 py-2 w-[24%]">Exercise</th>
+                            <th className="px-3 py-2 w-[18%]">Variation</th>
+                            <th className="px-3 py-2 w-[10%]">Sets</th>
+                            <th className="px-3 py-2 w-[10%]">Reps</th>
+                            <th className="px-3 py-2 w-[18%]">Load / Intensity</th>
+                            <th className="px-3 py-2 w-[10%]">Rest</th>
+                            <th className="px-3 py-2 w-[10%] text-right">Actions</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {(selectedClient.weeks?.[currentWeek]?.exercises || []).map(r => (
+                            <tr key={r.id} className="border-b border-neutral-900/70 hover:bg-neutral-900/30">
+                              <td className="px-3 py-2"><input value={r.exercise} onChange={e=>updateExercise(selectedClient.id, currentWeek, r.id, "exercise", e.target.value)} placeholder="e.g., Squat" className="w-full bg-transparent border border-neutral-800 rounded-md px-2 py-1" /></td>
+                              <td className="px-3 py-2"><input value={r.variation} onChange={e=>updateExercise(selectedClient.id, currentWeek, r.id, "variation", e.target.value)} placeholder="e.g., High-bar, Pause" className="w-full bg-transparent border border-neutral-800 rounded-md px-2 py-1" /></td>
+                              <td className="px-3 py-2"><input value={r.sets} onChange={e=>updateExercise(selectedClient.id, currentWeek, r.id, "sets", e.target.value)} placeholder="3" className="w-full bg-transparent border border-neutral-800 rounded-md px-2 py-1" /></td>
+                              <td className="px-3 py-2"><input value={r.reps} onChange={e=>updateExercise(selectedClient.id, currentWeek, r.id, "reps", e.target.value)} placeholder="8" className="w-full bg-transparent border border-neutral-800 rounded-md px-2 py-1" /></td>
+                              <td className="px-3 py-2"><input value={r.load} onChange={e=>updateExercise(selectedClient.id, currentWeek, r.id, "load", e.target.value)} placeholder="e.g., 185 lb, RPE 8, 75%" className="w-full bg-transparent border border-neutral-800 rounded-md px-2 py-1" /></td>
+                              <td className="px-3 py-2"><input value={r.rest} onChange={e=>updateExercise(selectedClient.id, currentWeek, r.id, "rest", e.target.value)} placeholder="90s" className="w-full bg-transparent border border-neutral-800 rounded-md px-2 py-1" /></td>
+                              <td className="px-3 py-2 text-right"><button className="rounded-lg border border-neutral-800 px-2 py-1 hover:bg-neutral-900" onClick={()=>removeExercise(selectedClient.id, currentWeek, r.id)}>Delete</button></td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </section>
+
+            {/* Delete client modal */}
+            {showDeleteConfirm && (
+              <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50">
+                <div className="bg-neutral-950 border border-neutral-800 rounded-2xl p-5 max-w-md w-[90%]">
+                  <div className="text-lg font-semibold mb-2">Delete client?</div>
+                  <div className="text-sm opacity-80 mb-4">This will permanently remove all weeks and exercises for <span className="font-medium">{selectedClient?.name}</span>.</div>
+                  <div className="flex gap-2 justify-end">
+                    <button className="rounded-xl border border-neutral-700 px-3 py-2" onClick={()=>setShowDeleteConfirm(false)}>Cancel</button>
+                    <button className="rounded-xl border border-red-900 bg-red-950/30 text-red-300 px-3 py-2" onClick={()=>{ if(selectedClient) deleteClient(selectedClient.id); setShowDeleteConfirm(false); }}>Yes, delete</button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Clear week modal */}
+            {clearDialog && (
+              <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50">
+                <div className="bg-neutral-950 border border-neutral-800 rounded-2xl p-5 max-w-md w-[90%]">
+                  <div className="text-lg font-semibold mb-2">Clear week?</div>
+                  <div className="text-sm opacity-80 mb-4">This will permanently delete week <span className="font-mono">{clearDialog.week}</span> for <span className="font-medium">{selectedClient?.name}</span> (exercises and notes).</div>
+                  <div className="flex gap-2 justify-end">
+                    <button className="rounded-xl border border-neutral-700 px-3 py-2" onClick={()=>setClearDialog(null)}>Cancel</button>
+                    <button className="rounded-xl border border-amber-900 bg-amber-950/30 text-amber-300 px-3 py-2" onClick={()=>{ clearWeek(clearDialog.clientId, clearDialog.week); setClearDialog(null); }}>Yes, clear</button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Paste backup modal */}
+            {pasteDialog && (
+              <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50">
+                <div className="bg-neutral-950 border border-neutral-800 rounded-2xl p-5 max-w-2xl w-[92%] space-y-3">
+                  <div className="text-lg font-semibold">Backup & Restore</div>
+                  <div className="text-sm opacity-80">Paste JSON here to restore, or use this box to copy your current data if clipboard is blocked.</div>
+                  <textarea className="w-full h-60 bg-neutral-900 border border-neutral-800 rounded-xl p-3 font-mono text-xs" value={pasteText} onChange={e=>setPasteText(e.target.value)} />
+                  <div className="flex gap-2 justify-end">
+                    <button className="rounded-xl border border-neutral-700 px-3 py-2" onClick={()=>setPasteDialog(false)}>Close</button>
+                    <button className="rounded-xl border border-neutral-800 px-3 py-2 hover:bg-neutral-900" onClick={()=>setPasteText(JSON.stringify(data, null, 2))}>Load current</button>
+                    <button className="rounded-xl border border-neutral-800 px-3 py-2 hover:bg-neutral-900" onClick={()=>applyPastedData("merge")}>Restore (merge)</button>
+                    <button className="rounded-xl border border-red-900 bg-red-950/30 text-red-300 px-3 py-2" onClick={()=>applyPastedData("replace")}>Restore (replace)</button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </main>
+
+          {/* Autosave indicator */}
+          <div className={`fixed bottom-3 right-3 z-50 text-xs select-none`}>
+            <div className={`flex items-center gap-2 px-3 py-2 rounded-full border ${autosave.isSaving ? 'animate-pulse border-neutral-600 bg-neutral-900' : 'border-neutral-800 bg-neutral-950/70'} backdrop-blur`}
+                title={autosave.last ? `Last saved ${formatTime(autosave.last)}` : 'Autosave is active'}>
+              <span aria-hidden>💪</span>
+              <span className="opacity-80">
+                {autosave.isSaving ? 'Autosaving…' : (autosave.last ? `Saved ${formatTime(autosave.last)}` : 'Autosave ready')}
+              </span>
+            </div>
+          </div>
+
+          {toast && (
+            <div className="fixed top-3 right-3 z-50 text-xs bg-neutral-900 border border-neutral-700 px-3 py-2 rounded-lg">
+              {toast.msg}
+            </div>
+          )}
+          <footer className="px-4 py-6 text-xs opacity-60">Data is stored locally on this device. Use Export/Backup for safety.</footer>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
